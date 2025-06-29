@@ -1,12 +1,12 @@
 # version: "3.8"
 
 services:
-  # Use a separate Redis instance to avoid conflicts
+  # Redis - Keep internal only for security
   tabular-redis:
     image: redis:8.0-alpine
     container_name: tabular-review-redis
     ports:
-      - "127.0.0.1:6380:6379" # Different port to avoid conflict
+      - "127.0.0.1:6380:6379" # Internal only - Redis should not be public
     volumes:
       - tabular-redis-data:/data
     command: redis-server --save 60 1 --loglevel warning --maxmemory 256mb --maxmemory-policy allkeys-lru --port 6379
@@ -24,6 +24,7 @@ services:
     networks:
       - tabular-backend
 
+  # Main API Backend - External access enabled
   backend:
     build:
       context: .
@@ -35,30 +36,36 @@ services:
       - HOME=/tmp/app
       - TMPDIR=/tmp/app
       - REDIS_URL=redis://tabular-redis:6379
+      # Production environment variables
+      - GUNICORN_WORKERS=3
+      - GUNICORN_THREADS=2
+      - GUNICORN_TIMEOUT=120
+      - GUNICORN_GRACEFUL_TIMEOUT=30
     working_dir: /app/backend
     command: >
       gunicorn main:app
       -k uvicorn.workers.UvicornWorker
-      -w 3
-      --threads 2
-      --timeout 120
-      --graceful-timeout 30
+      -w ${GUNICORN_WORKERS:-3}
+      --threads ${GUNICORN_THREADS:-2}
+      --timeout ${GUNICORN_TIMEOUT:-120}
+      --graceful-timeout ${GUNICORN_GRACEFUL_TIMEOUT:-30}
       --preload
       --bind 0.0.0.0:8000
       --access-logfile -
       --error-logfile -
+      --access-logformat '%(h)s %(l)s %(u)s %(t)s "%(r)s" %(s)s %(b)s "%(f)s" "%(a)s" %(D)s'
     volumes:
       - ./backend:/app/backend
       - tabular-uploads:/app/uploads
       - tabular-tmp:/tmp/app
     ports:
-      - "127.0.0.1:8001:8000" # Use port 8001 to avoid conflicts, bind to localhost only
+      - "8001:8000" # External access enabled - Remove 127.0.0.1 binding
     depends_on:
       tabular-redis:
         condition: service_healthy
     restart: unless-stopped
     healthcheck:
-      test: ["CMD-SHELL", "curl -f http://localhost:8000/api/health || exit 1"]
+      test: ["CMD-SHELL", "curl -f http://localhost:8000/api/health/ || exit 1"]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -67,17 +74,18 @@ services:
       resources:
         limits:
           memory: 1G
-          cpus: "0.8" # Reduced to leave resources for existing services
+          cpus: "0.8"
     networks:
       - tabular-backend
 
+  # Celery Worker
   celery-worker:
     build:
       context: .
       dockerfile: Dockerfile
     container_name: tabular-review-celery-worker
     working_dir: /app/backend
-    command: celery -A celery_app worker --loglevel=info --concurrency=2 --max-tasks-per-child=1000
+    command: celery -A celery_app worker --loglevel=info --concurrency=${CELERY_WORKER_CONCURRENCY:-2} --max-tasks-per-child=${CELERY_MAX_TASKS_PER_CHILD:-1000}
     env_file:
       - .env
     environment:
@@ -94,6 +102,12 @@ services:
       backend:
         condition: service_healthy
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "celery -A celery_app inspect ping || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
     deploy:
       resources:
         limits:
@@ -102,6 +116,7 @@ services:
     networks:
       - tabular-backend
 
+  # Celery Beat Scheduler
   celery-beat:
     build:
       context: .
@@ -125,6 +140,12 @@ services:
       backend:
         condition: service_healthy
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "ps aux | grep '[c]elery.*beat' || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
     deploy:
       resources:
         limits:
@@ -133,7 +154,7 @@ services:
     networks:
       - tabular-backend
 
-  # Optional: Flower for monitoring (only in development)
+  # Flower Monitoring - Keep internal only for security
   celery-flower:
     build:
       context: .
@@ -142,7 +163,7 @@ services:
     working_dir: /app/backend
     command: celery -A celery_app flower --port=5555 --broker=redis://tabular-redis:6379
     ports:
-      - "127.0.0.1:5556:5555" # Different port to avoid conflicts
+      - "127.0.0.1:5556:5555" # Internal only - monitoring should not be public
     env_file:
       - .env
     environment:
@@ -151,6 +172,11 @@ services:
       - tabular-redis
       - celery-worker
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:5555 || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
     deploy:
       resources:
         limits:
@@ -173,7 +199,6 @@ networks:
   tabular-backend:
     driver: bridge
     name: tabular-review-network
-    # Use custom subnet to avoid conflicts with existing networks
     ipam:
       config:
         - subnet: 172.20.0.0/16
