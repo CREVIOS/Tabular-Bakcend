@@ -1,4 +1,3 @@
-# tabular_reviews_v2.py - COMPLETE Industrial-grade WebSocket implementation
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect, Depends, HTTPException, BackgroundTasks, Query, Response
 from fastapi.responses import StreamingResponse
 from typing import Dict, Set, List, Optional
@@ -193,7 +192,17 @@ class CellProcessor:
                     await redis_client.setex(cache_key, 3600, msgpack.packb(document_content.encode('utf-8')))
             
             if not document_content:
-                return None
+                return {
+                    'review_id': item['review_id'],
+                    'file_id': item['file_id'],
+                    'column_id': item['column_id'],
+                    'short_answer': None,
+                    'long_answer': None,
+                    'confidence': 0.0,
+                    'source': 'Document content not found',
+                    'timestamp': time.time(),
+                    'retry_needed': True
+                }
             
             # Call Gemini (in thread pool to not block)
             loop = asyncio.get_event_loop()
@@ -206,82 +215,113 @@ class CellProcessor:
                 item.get('data_type', 'text')
             )
             
+            # Check if we got a valid response
+            retry_needed = False
+            if (result.get('short_answer') is None and result.get('long_answer') is None) or result.get('confidence', 0) == 0.0:
+                retry_needed = True
+            
             return {
                 'review_id': item['review_id'],
                 'file_id': item['file_id'],
                 'column_id': item['column_id'],
-                'value': result.get('value'),
+                'short_answer': result.get('short_answer'),
+                'long_answer': result.get('long_answer'),
                 'confidence': result.get('confidence', 0.0),
                 'source': result.get('source', ''),
-                'timestamp': time.time()
+                'timestamp': time.time(),
+                'retry_needed': retry_needed,
+                'prompt': item.get('prompt', ''),
+                'column_name': item.get('column_name', ''),
+                'data_type': item.get('data_type', 'text'),
+                'user_id': item.get('user_id', '')
             }
+        
             
         except Exception as e:
             print(f"Cell processing error: {e}")
-            return None
+            return {
+                'review_id': item['review_id'],
+                'file_id': item['file_id'],
+                'column_id': item['column_id'],
+                'short_answer': None,
+                'long_answer': None,
+                'confidence': 0.0,
+                'source': f'Processing error: {str(e)}',
+                'timestamp': time.time(),
+                'retry_needed': True,
+                'prompt': item.get('prompt', ''),
+                'column_name': item.get('column_name', ''),
+                'data_type': item.get('data_type', 'text'),
+                'user_id': item.get('user_id', '')
+            }
     
     def _gemini_extract(self, content: str, prompt: str, column_name: str, data_type: str) -> dict:
         """Synchronous Gemini call for thread pool"""
         try:
-            model = genai.GenerativeModel('gemini-2.5-flash')
+            model = genai.GenerativeModel('gemini-2.5-pro')
             
             analysis_prompt = f"""
-You are an expert document analyst with exceptional attention to detail. Your task is to extract specific information from the provided document based on precise analysis requirements.
+    You are an expert document analyst with exceptional attention to detail. Your task is to extract specific information from the provided document based on precise analysis requirements.
 
-DOCUMENT CONTENT:
-{content[:10000]}
+    DOCUMENT CONTENT:
+    {content}
 
-ANALYSIS REQUIREMENT:
-• Column Name: {column_name}
-• Extraction Requirement: {prompt}
-• Expected Data Type: {data_type}
-• Relevance Threshold: High - only extract if information directly matches the requirement
+    ANALYSIS REQUIREMENT:
+    • Extraction Requirement: {prompt}
+    • Expected Data Type: {data_type}
 
-EXTRACTION GUIDELINES:
+    CRITICAL INSTRUCTIONS:
+    1. ONLY extract information that is EXPLICITLY stated in the document
+    2. Do NOT infer, assume, or extrapolate beyond what is clearly written
+    3. Do NOT hallucinate or create information not present in the document
+    4. If information is ambiguous or unclear, treat as not found
+    5. Check the document CAREFULLY and THOROUGHLY before responding
 
-1. RELEVANCE CRITERIA:
-   - Only extract information that DIRECTLY and CLEARLY matches the specified requirement
-   - Information must be explicitly stated or clearly derivable from the document
-   - Do NOT infer, assume, or extrapolate beyond what is explicitly present
-   - If information is ambiguous, partial, or requires significant interpretation, treat as not found
+    RESPONSE REQUIREMENTS:
+    You must provide TWO versions of your answer:
+    - SHORT_ANSWER: A concise, if possible just give the answer, no extra words. (1-2 sentences maximum if needed).
+    - LONG_ANSWER: A detailed explanation with full context and supporting details
 
-2. VALUE ASSIGNMENT:
-   - If relevant information is found: Extract the precise value
-   - If NO relevant information is found: Return "No Valid Data"
-   - If information exists but is unclear/incomplete: Return "No Valid Data"
+    VALUE ASSIGNMENT RULES:
+    - If relevant information is found: Extract the precise value
+    - If NO relevant information is found: Return "No Valid Data"
+    - If information exists but is unclear/incomplete: Return "No Valid Data"
 
-3. CONFIDENCE SCORING (0.0 to 1.0):
-   - 0.9-1.0: Information is explicitly stated and unambiguous
-   - 0.7-0.8: Information is clearly stated but requires minor interpretation
-   - 0.5-0.6: Information is present but somewhat ambiguous
-   - 0.3-0.4: Information is implied or requires significant interpretation
-   - 0.0-0.2: Information is unclear, contradictory, or barely relevant
+    CONFIDENCE SCORING (0.0 to 1.0):
+    - 0.95-1.0: Information is explicitly stated, unambiguous, and directly matches requirement
+    - 0.85-0.94: Information is clearly stated with minor interpretation needed
+    - 0.70-0.84: Information is present but requires some interpretation
+    - 0.50-0.69: Information is implied or requires significant interpretation
+    - 0.30-0.49: Information is vague or partially relevant
+    - 0.0-0.29: Information is unclear, contradictory, or barely relevant
 
-4. DATA TYPE FORMATTING:
-   - text: Return as plain string, no special formatting
-   - number: Return as numeric value (integer or decimal)
-   - date: Return in YYYY-MM-DD format if possible
-   - boolean: Return as true/false
-   - currency: Return numeric value without currency symbols
-   - percentage: Return as decimal (e.g., 0.25 for 25%)
+    DATA TYPE FORMATTING:
+    - text: Return as plain string, no special formatting
+    - number: Return as numeric value (integer or decimal)
+    - date: Return in YYYY-MM-DD format if possible
+    - boolean: Return as true/false
+    - currency: Return numeric value without currency symbols
+    - percentage: Return as decimal (e.g., 0.25 for 25%)
 
-5. SOURCE REFERENCE:
-   - Provide specific location: "Page X, Paragraph Y" or "Section Z, Line N"
-   - Include relevant surrounding context if helpful
-   - For tables: "Table X, Row Y, Column Z"
-   - For headers/titles: "Header: [title name]"
+    SOURCE REFERENCE:
+    - Provide specific location: "Page X, Paragraph Y" or "Section Z, Line N"
+    - Include relevant surrounding context if helpful
+    - For tables: "Table X, Row Y, Column Z"
+    - For headers/titles: "Header: [title name]"
+    -  The source should be valid chunk  with renference. Like the page, then section, the paragraph, then the chunk for validity. If there is multiple, have them.
 
-RESPONSE FORMAT:
-Return ONLY a valid JSON object with this exact structure. Do not include any explanatory text, comments, or additional formatting:
+    RESPONSE FORMAT:
+    Return ONLY a valid JSON object with this exact structure:
 
-{{
-    "value": "extracted_value_or_No Valid Data",
-    "confidence": 0.95,
-    "source": "Page 1, Section 2.1, Paragraph 3"
-}}
+    {{
+        "short_answer": "concise_value_or_No Valid Data",
+        "long_answer": "detailed_explanation_with_context_or_No Valid Data",
+        "confidence": 0.95,
+        "source": "Page 1, Section 2.1, Paragraph 3, the chunk texts"
+    }}
 
-CRITICAL: Your response must be valid JSON only. No other text, explanations, or markdown formatting.
-"""
+    CRITICAL: Your response must be valid JSON only. No other text, explanations, or markdown formatting.
+    """
             
             response = model.generate_content(analysis_prompt)
             response_text = response.text.strip()
@@ -294,14 +334,47 @@ CRITICAL: Your response must be valid JSON only. No other text, explanations, or
             
             try:
                 extraction = json.loads(response_text)
-                return extraction
+                
+                # Validate response structure
+                required_keys = ['short_answer', 'long_answer', 'confidence', 'source']
+                if not all(key in extraction for key in required_keys):
+                    print(f"Invalid response structure: {extraction}")
+                    return {
+                        "short_answer": None, 
+                        "long_answer": None, 
+                        "confidence": 0.0, 
+                        "source": "Analysis failed - invalid response structure"
+                    }
+                
+                # Validate confidence score
+                confidence = extraction.get('confidence', 0.0)
+                if not isinstance(confidence, (int, float)) or confidence < 0 or confidence > 1:
+                    extraction['confidence'] = 0.0
+                
+                return {
+                    "short_answer": extraction.get('short_answer'),
+                    "long_answer": extraction.get('long_answer'),
+                    "confidence": extraction.get('confidence', 0.0),
+                    "source": extraction.get('source', "")
+                }
+                
             except json.JSONDecodeError:
                 print(f"Failed to parse Gemini response as JSON: {response_text}")
-                return {"value": None, "confidence": 0.0, "source": "Analysis failed"}
+                return {
+                    "short_answer": None, 
+                    "long_answer": None, 
+                    "confidence": 0.0, 
+                    "source": "Analysis failed - JSON parse error"
+                }
                 
         except Exception as e:
             print(f"Gemini analysis failed: {str(e)}")
-            return {"value": None, "confidence": 0.0, "source": "Analysis failed"}
+            return {
+                "short_answer": None, 
+                "long_answer": None, 
+                "confidence": 0.0, 
+                "source": f"Analysis failed: {str(e)}"
+            }
     
     async def _fetch_document_content(self, file_id: str, user_id: str) -> str:
         """Fetch document content from Supabase"""
@@ -353,11 +426,52 @@ async def processing_worker():
             print(f"Worker error: {e}")
             await asyncio.sleep(0.1)
 
+
+
+async def store_result_in_database(result: dict):
+    """Store analysis result in Supabase"""
+    try:
+        supabase = get_supabase_admin()
+        
+        result_record = {
+            "id": str(uuid.uuid4()),
+            "review_id": result['review_id'],
+            "file_id": result['file_id'],
+            "column_id": result['column_id'],
+            "extracted_value": result.get('short_answer'),
+            "long": result.get('long_answer'),
+            "confidence_score": result.get('confidence', 0.0),
+            "source_reference": result.get('source', ''),
+            "created_at": datetime.utcnow().isoformat(),
+            "updated_at": datetime.utcnow().isoformat()
+        }
+        
+        # Upsert result
+        supabase.table("tabular_review_results").upsert(
+            result_record, 
+            on_conflict="review_id,file_id,column_id"
+        ).execute()
+        
+        print(f"✅ Stored result: {result['file_id']} x {result['column_id']}")
+        
+    except Exception as e:
+        print(f"Error storing result: {e}")
+
+# Add retry tracking
+retry_queue = asyncio.Queue(maxsize=500)
+
 async def result_sender_worker():
-    """Send results to WebSocket clients and store in database"""
+    """Send results to WebSocket clients and store in database with retry logic"""
     while True:
         try:
             result = await processor.result_queue.get()
+            
+            # Check if retry is needed
+            if result.get('retry_needed', False):
+                # Add to retry queue with a delay
+                await asyncio.sleep(2)  # Wait 2 seconds before retry
+                await retry_queue.put(result)
+                continue
             
             # Store result in Supabase
             await store_result_in_database(result)
@@ -365,7 +479,16 @@ async def result_sender_worker():
             # Send update via WebSocket
             update = {
                 'type': 'cell_update',
-                'data': result
+                'data': {
+                    'review_id': result['review_id'],
+                    'file_id': result['file_id'],
+                    'column_id': result['column_id'],
+                    'short_answer': result.get('short_answer'),
+                    'long_answer': result.get('long_answer'),
+                    'confidence': result.get('confidence', 0.0),
+                    'source': result.get('source', ''),
+                    'timestamp': result['timestamp']
+                }
             }
             
             # Get user_id from review
@@ -373,7 +496,7 @@ async def result_sender_worker():
             if user_id:
                 await manager.send_to_review(user_id, result['review_id'], update)
                 
-            # --- COMPLETION CHECK AND STATUS UPDATE ---
+            # Completion check and status update (same as before)
             supabase = get_supabase_admin()
             review_id = result['review_id']
             # Get total columns
@@ -393,7 +516,7 @@ async def result_sender_worker():
                     "last_processed_at": datetime.utcnow().isoformat(),
                     "updated_at": datetime.utcnow().isoformat()
                 }).eq("id", review_id).execute()
-                # Optionally, send a WebSocket notification
+                # Send completion notification
                 if user_id:
                     await manager.send_to_review(user_id, review_id, {
                         'type': 'review_completed',
@@ -405,33 +528,49 @@ async def result_sender_worker():
             print(f"Result sender error: {e}")
             await asyncio.sleep(0.1)
 
-async def store_result_in_database(result: dict):
-    """Store analysis result in Supabase"""
-    try:
-        supabase = get_supabase_admin()
-        
-        result_record = {
-            "id": str(uuid.uuid4()),
-            "review_id": result['review_id'],
-            "file_id": result['file_id'],
-            "column_id": result['column_id'],
-            "extracted_value": result.get('value'),
-            "confidence_score": result.get('confidence', 0.0),
-            "source_reference": result.get('source', ''),
-            "created_at": datetime.utcnow().isoformat(),
-            "updated_at": datetime.utcnow().isoformat()
-        }
-        
-        # Upsert result
-        supabase.table("tabular_review_results").upsert(
-            result_record, 
-            on_conflict="review_id,file_id,column_id"
-        ).execute()
-        
-        print(f"✅ Stored result: {result['file_id']} x {result['column_id']}")
-        
-    except Exception as e:
-        print(f"Error storing result: {e}")
+async def retry_worker():
+    """Handle retry logic for failed cells"""
+    retry_attempts = {}
+    max_retries = 3
+    
+    while True:
+        try:
+            result = await retry_queue.get()
+            
+            key = f"{result['review_id']}:{result['file_id']}:{result['column_id']}"
+            attempts = retry_attempts.get(key, 0)
+            
+            if attempts < max_retries:
+                retry_attempts[key] = attempts + 1
+                print(f"🔄 Retrying cell {key}, attempt {attempts + 1}")
+                
+                # Re-queue for processing with all necessary data
+                await processor.processing_queue.put({
+                    'review_id': result['review_id'],
+                    'file_id': result['file_id'],
+                    'column_id': result['column_id'],
+                    'prompt': result.get('prompt', ''),
+                    'column_name': result.get('column_name', ''),
+                    'data_type': result.get('data_type', 'text'),
+                    'user_id': result.get('user_id', '')
+                })
+            else:
+                print(f"❌ Max retries reached for cell {key}")
+                # Store failed result to mark as processed
+                await store_result_in_database({
+                    'review_id': result['review_id'],
+                    'file_id': result['file_id'],
+                    'column_id': result['column_id'],
+                    'short_answer': 'Processing failed',
+                    'long_answer': 'Processing failed after multiple attempts',
+                    'confidence': 0.0,
+                    'source': 'Max retries exceeded',
+                    'timestamp': time.time()
+                })
+                
+        except Exception as e:
+            print(f"Retry worker error: {e}")
+            await asyncio.sleep(1)
 
 # Initialize processor
 processor = CellProcessor()
@@ -441,10 +580,12 @@ async def _redis_listener():
     """Listen for Redis events and process them"""
     # Start background workers
     worker_tasks = []
-    for _ in range(5):  # 5 processing workers
+    for _ in range(5):  
         worker_tasks.append(asyncio.create_task(processing_worker()))
     
+    # Add result sender and retry workers
     worker_tasks.append(asyncio.create_task(result_sender_worker()))
+    worker_tasks.append(asyncio.create_task(retry_worker()))  # Add retry worker
     
     # Keep the listener running
     while True:
@@ -1200,6 +1341,7 @@ async def analyze_new_files_immediate(review_id: str, file_ids: List[str], user_
                     'data_type': column.get('data_type', 'text'),
                     'user_id': user_id
                 })
+
         
         print(f"🎉 Queued {len(file_ids) * len(columns_response.data)} cells for processing")
         
@@ -1330,6 +1472,7 @@ async def analyze_new_column_immediate(review_id: str, column_id: str, user_id: 
                 'data_type': column.get('data_type', 'text'),
                 'user_id': user_id
             })
+
         
         print(f"🎉 Queued {len(files_response.data)} cells for column analysis using column ID: {column['id']}")
         
@@ -1973,3 +2116,4 @@ async def cleanup_old_cache():
             break
 
 print("🚀")
+
