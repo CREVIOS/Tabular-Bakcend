@@ -303,24 +303,54 @@ class CellProcessor:
     - currency: Return numeric value without currency symbols
     - percentage: Return as decimal (e.g., 0.25 for 25%)
 
-    SOURCE REFERENCE:
-    - Provide specific location: "Page X, Paragraph Y" or "Section Z, Line N"
-    - Include relevant surrounding context if helpful
-    - For tables: "Table X, Row Y, Column Z"
-    - For headers/titles: "Header: [title name]"
-    -  The source should be valid chunk  with renference. Like the page, then section, the paragraph, then the chunk for validity. If there is multiple, have them.
+    SOURCE REFERENCE (CRITICAL - MUST BE JSON):
+    The source must be a valid JSON object or array containing structured location information for PDF highlighting:
+
+    For single source:
+    {{
+        "page": 1,
+        "section": "Section 2.1",
+        "paragraph": 3,
+        "text_excerpt": "exact text found in document",
+        "location_type": "paragraph|table|header|footer",
+        "bounding_info": "additional location details if available"
+    }}
+
+    For multiple sources:
+    [
+        {{
+            "page": 1,
+            "section": "Section 2.1", 
+            "paragraph": 3,
+            "text_excerpt": "first excerpt",
+            "location_type": "paragraph"
+        }},
+        {{
+            "page": 2,
+            "section": "Section 3.1",
+            "paragraph": 1, 
+            "text_excerpt": "second excerpt",
+            "location_type": "table"
+        }}
+    ]
+
+    IMPORTANT SOURCE RULES:
+    - Always include the exact text excerpt that contains the information
+    - Provide page numbers when available
+    - Include section/paragraph references for precise location
+    - If multiple locations support the answer, include all of them
+    - If no specific location can be determined, use: {{"page": null, "text_excerpt": "No specific location found", "location_type": "unknown"}}
 
     RESPONSE FORMAT:
     Return ONLY a valid JSON object with this exact structure:
-
     {{
         "short_answer": "concise_value_or_No Valid Data",
-        "long_answer": "detailed_explanation_with_context_or_No Valid Data",
+        "long_answer": "detailed_explanation_with_context_or_No Valid Data", 
         "confidence": 0.95,
-        "source": "Page 1, Section 2.1, Paragraph 3, the chunk texts"
+        "source": {{"page": 1, "section": "Section 2.1", "paragraph": 3, "text_excerpt": "exact text chunk", "location_type": "paragraph"}}
     }}
 
-    CRITICAL: Your response must be valid JSON only. No other text, explanations, or markdown formatting.
+    CRITICAL: Your response must be valid JSON only. The source field must be a JSON object or array, not a string. No other text, explanations, or markdown formatting.
     """
             
             response = model.generate_content(analysis_prompt)
@@ -343,7 +373,7 @@ class CellProcessor:
                         "short_answer": None, 
                         "long_answer": None, 
                         "confidence": 0.0, 
-                        "source": "Analysis failed - invalid response structure"
+                        "source": {"page": None, "text_excerpt": "Analysis failed - invalid response structure", "location_type": "error"}
                     }
                 
                 # Validate confidence score
@@ -351,11 +381,30 @@ class CellProcessor:
                 if not isinstance(confidence, (int, float)) or confidence < 0 or confidence > 1:
                     extraction['confidence'] = 0.0
                 
+                # Validate source is JSON object/array
+                source = extraction.get('source', {})
+                if isinstance(source, str):
+                    # Convert string source to JSON object for backward compatibility
+                    source = {
+                        "page": None,
+                        "text_excerpt": source,
+                        "location_type": "legacy"
+                    }
+                    extraction['source'] = source
+                
+                # Ensure source is valid JSON structure
+                if not isinstance(source, (dict, list)):
+                    extraction['source'] = {
+                        "page": None,
+                        "text_excerpt": "Invalid source format",
+                        "location_type": "error"
+                    }
+                
                 return {
                     "short_answer": extraction.get('short_answer'),
                     "long_answer": extraction.get('long_answer'),
                     "confidence": extraction.get('confidence', 0.0),
-                    "source": extraction.get('source', "")
+                    "source": extraction.get('source', {})
                 }
                 
             except json.JSONDecodeError:
@@ -364,7 +413,7 @@ class CellProcessor:
                     "short_answer": None, 
                     "long_answer": None, 
                     "confidence": 0.0, 
-                    "source": "Analysis failed - JSON parse error"
+                    "source": {"page": None, "text_excerpt": "Analysis failed - JSON parse error", "location_type": "error"}
                 }
                 
         except Exception as e:
@@ -373,7 +422,7 @@ class CellProcessor:
                 "short_answer": None, 
                 "long_answer": None, 
                 "confidence": 0.0, 
-                "source": f"Analysis failed: {str(e)}"
+                "source": {"page": None, "text_excerpt": f"Analysis failed: {str(e)}", "location_type": "error"}
             }
     
     async def _fetch_document_content(self, file_id: str, user_id: str) -> str:
@@ -2116,4 +2165,3 @@ async def cleanup_old_cache():
             break
 
 print("🚀")
-
